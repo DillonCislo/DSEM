@@ -18,11 +18,12 @@
 
 #include "DSEM.h"
 #include "clipToUnitCircle.h"
+#include "../LBFGS/BFGSMat.h"
+#include "../LBFGS/LineSearchBacktracking.h"
 
 #include <cassert>
 #include <stdexcept>
 #include <iostream>
-#include <vector>
 #include <cmath>
 #include <omp.h>
 
@@ -32,6 +33,7 @@
 #include <igl/setdiff.h>
 #include <igl/edge_lengths.h>
 #include <igl/doublearea.h>
+#include <igl/unique_edge_map.h>
 
 // ======================================================================================
 // CONSTRUCTOR FUNCTIONS
@@ -66,8 +68,30 @@ DSEMpp::DSEM<Scalar, Index>::DSEM(
   }
 
   // Construct the triangulation edge list
-  m_E = Eigen::Matrix<Index, Eigen::Dynamic, 2>::Zero(1,2);
-  igl::edges( m_F, m_E );
+  Eigen::Matrix<Index, Eigen::Dynamic, 2> dE(1,2); // Directed edge list
+  m_E = Eigen::Matrix<Index, Eigen::Dynamic, 2>::Zero(1,2); // Undirected edge list
+  IndexVector FE(1);
+  std::vector<std::vector<Index> > uE2E; // Unused - shouldn't be necessary...
+  igl::unique_edge_map( m_F, dE, m_E, FE, uE2E );
+
+  // Reserve space for the edge-face correspondence list
+  m_EF.reserve( m_E.rows() );
+  for( int i = 0; i < m_E.rows(); i++ ) {
+    std::vector<Index> tmpVec;
+    m_EF.push_back(tmpVec);
+  }
+
+  // Assemble the face-edge and edge-face correspondence lists
+  m_FE.resizeLike( m_F );
+  for( int i = 0; i < m_F.rows(); i++ ) {
+    for( int j = 0; j < 3; j++ ) {
+
+      m_FE(i,j) = FE( i + (j * m_F.rows()) );
+
+      m_EF[ m_FE(i,j) ].push_back( (Index) i );
+
+    }
+  }
 
   // Verify that the triangulation is a topological disk
   int eulerChi = m_x.rows() - m_E.rows() + m_F.rows();
@@ -140,6 +164,20 @@ DSEMpp::DSEM<Scalar, Index>::DSEM(
   // Construct the vertex area matrix
   RowVector VAT = m_vertexAreas.transpose();
   m_vertexAreaMat = VAT.replicate( m_x.rows(), 1 );
+
+  // Construct the sparse identity matrix
+  typedef Eigen::Triplet<Scalar> T;
+
+  std::vector<T> tListI;
+  tListI.reserve( 2 * m_V.rows() );
+
+  for( int i = 0; i < (2 * m_V.rows()); i++ ) {
+    tListI.push_back( T(i, i, Scalar(1.0)) );
+  }
+
+  Eigen::SparseMatrix<Scalar> speye( 2 * m_V.rows(), 2 * m_V.rows() );
+  speye.setFromTriplets( tListI.begin(), tListI.end() );
+  m_speye = speye;
 
 };
 
@@ -332,79 +370,67 @@ void DSEMpp::DSEM<Scalar, Index>::constructAveragingOperators() {
 /// Beltrami coefficient
 ///
 template <typename Scalar, typename Index>
-DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingKernel(
-    const CplxVector &w, Array &G1, Array &G2, Array &G3, Array &G4 ) {
+DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingKernel (
+    const CplxVector &w, Array &G1, Array &G2, Array &G3, Array &G4 ) const {
 
   // Number of vertices
   int numV = m_V.rows();
 
   // The squared partial derivative dw/dz defined on vertices
-  CplxArrayVec DWz2 = ( m_F2V * m_Dz * w ).array();
-  DWz2 = DWz2 * DWz2;
+  CplxVector DWz2(numV, 1);
+  DWz2.noalias() = m_F2V * m_Dz * w;
+  DWz2 = (DWz2.array() * DWz2.array()).matrix();
 
-  // Convenience variables for conjugates
-  CplxArrayVec wC = w.array().conjugate();
-  CplxArrayVec DWz2C = DWz2.conjugate();
+  // Cached variables for conjugates
+  CplxVector wC = w.conjugate();
+  CplxVector DWz2C = DWz2.conjugate();
+
+  // More cached variables to avoid duplicate computations
+  CplxVector xi = w.array() * (Scalar(1.0) - w.array());
+  CplxVector xiC = xi.conjugate();
+
+  CplxVector pixi = Scalar(M_PI) * xi;
+  CplxVector pixiC = pixi.conjugate();
 
   // Construct Complex Coefficients -----------------------------------------------------
   
-  // Numerator and denominator for the coefficient of nu
-  CplxArray Anum( numV, numV );
-  CplxArray Adenom( numV, numV );
-
-  // Numerator and denominator for the coefficient of nuC
-  CplxArray Bnum( numV, numV );
-  CplxArray Bdenom( numV, numV );
-
   #pragma omp parallel for collapse(2)
   for( int i = 0; i < numV; i++ ) {
     for( int j = 0; j < numV; j++ ) {
 
-      Anum(i,j) = -w(i) * (w(i) - Scalar(1.0)) * DWz2(j);
-      Adenom(i,j) = Scalar(M_PI) * w(j) * (w(j) - Scalar(1.0)) * (w(j) - w(i));
+      CScalar Anum = xi(i) * DWz2(j);
+      CScalar Adenom = pixi(j) * (w(i) - w(j));
 
-      if ( std::abs(Adenom(i,j)) < Scalar(1e-14) ) {
-        Adenom(i,j) = CScalar(Scalar(0.0), Scalar(0.0));
+      if ( std::abs(Adenom) < Scalar(1e-14) ) {
+        Adenom = CScalar(Scalar(0.0), Scalar(0.0));
       }
 
-      Bnum(i,j) = -w(i) * (w(i) - Scalar(1.0)) * DWz2C(j);
-      Bdenom(i,j) = Scalar(M_PI) * wC(j) * (Scalar(1.0) - wC(j)) * (Scalar(1.0) - wC(j) * w(i));
+      CScalar Bnum = xi(i) * DWz2C(j);
+      CScalar Bdenom = pixiC(j) * (Scalar(1.0) - wC(j) * w(i));
 
-      if ( std::abs(Bdenom(i,j)) < Scalar(1e-14) ) {
-        Bdenom(i,j) = CScalar(Scalar(0.0), Scalar(0.0));
+      if ( std::abs(Bdenom) < Scalar(1e-14) ) {
+        Bdenom = CScalar(Scalar(0.0), Scalar(0.0));
       }
 
-    }
-  }
+      CScalar A = Anum / Adenom; // The complex coefficient of nu
+      CScalar B = Bnum / Bdenom; // The complex coefficient of nuC
 
-  CplxArray A = Anum / Adenom; // The complex coefficient of nu
-  CplxArray B = Bnum / Bdenom; // The complex coefficient of nuC
+      // Construct real mapping kernel coefficients
+      G1(i,j) = A.real() + B.real();
+      G2(i,j) = B.imag() - A.imag();
+      G3(i,j) = A.imag() + B.imag();
+      G4(i,j) = A.real() - B.real();
 
-  // Extract real and imaginary parts
-  Array A1 = A.real();
-  Array A2 = A.imag();
-  Array B1 = B.real();
-  Array B2 = B.imag();
-
-  // Handle singularities
-  for( int i = 0; i < numV; i++ ) {
-    for( int j = 0; j < numV; j++ ) {
-      
-      // NOTE: 'isnan' and 'isinf' are not templated functions
+      // Deal with singularities
+      // NOTE: 'isinfinite' is not a templated function
       // One workaround is to convert all input arguments to doubles
-      if ( !std::isfinite( (double) A1(i,j)) ) { A1(i,j) = Scalar(0.0); }
-      if ( !std::isfinite( (double) A2(i,j)) ) { A2(i,j) = Scalar(0.0); }
-      if ( !std::isfinite( (double) B1(i,j)) ) { B1(i,j) = Scalar(0.0); }
-      if ( !std::isfinite( (double) B2(i,j)) ) { B2(i,j) = Scalar(0.0); }
+      if ( !std::isfinite( (double) G1(i,j)) ) { G1(i,j) = Scalar(0.0); }
+      if ( !std::isfinite( (double) G2(i,j)) ) { G2(i,j) = Scalar(0.0); }
+      if ( !std::isfinite( (double) G3(i,j)) ) { G3(i,j) = Scalar(0.0); }
+      if ( !std::isfinite( (double) G4(i,j)) ) { G4(i,j) = Scalar(0.0); }
 
     }
   }
-
-  // Construct real mapping kernel coefficients
-  G1 = A1 + B1;
-  G2 = B2 - A2;
-  G3 = A2 + B2;
-  G4 = A1 - B1;
 
 };
 
@@ -414,9 +440,9 @@ DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingKernel(
 /// Holomorphic Flow
 ///
 template <typename Scalar, typename Index>
-DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingUpdate(
+DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingUpdate (
     const CplxVector &nu, const Array &G1, const Array &G2,
-    const Array &G3, const Array &G4, CplxVector &dW ) {
+    const Array &G3, const Array &G4, CplxVector &dW ) const {
 
   // Number of vertices
   int numV = m_V.rows();
@@ -451,11 +477,11 @@ DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::calculateMappingUpdate(
 /// from vertex based gradients
 ///
 template <typename Scalar, typename Index>
-DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::energyGradientOperator(
+DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::energyGradientOperator (
     const Matrix &DXu, const Matrix &DXv,
     const Eigen::Matrix<Scalar, Eigen::Dynamic, 3> &eVec,
     const Vector &l, const Vector &L, const Vector &tarA_E,
-    RowVector &GOp ) {
+    RowVector &GOp ) const {
 
   // Number of vertices
   int numV = m_V.rows();
@@ -505,7 +531,12 @@ DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::energyGradientOperator(
 
   // Create edge-sum operator -----------------------------------------------------------
   
-  ArrayVec WEV = Scalar(2.0) * tarA_E.array() * (l.array() - L.array()) / l.array();
+  // UNSCALED OPERATOR
+  // ArrayVec WEV = Scalar(2.0) * tarA_E.array() * (l.array() - L.array()) / l.array();
+
+  // SCALED OPERATOR
+  ArrayVec WEV = Scalar(2.0) * tarA_E.array() * (l.array() - L.array())
+    / ( tarA_E.sum() * l.array() * L.array() * L.array() );
 
   Vector GOp3T( 3*numE, 1 );
   GOp3T << (WEV * eVec.col(0).array()).matrix(),
@@ -524,11 +555,11 @@ DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::energyGradientOperator(
 /// Calculate the DSEM energy functional for a given configuration
 ///
 template <typename Scalar, typename Index>
-Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergy(
+Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergy (
     const Vector &L, const Vector &tarA_E, const Vector &tarA_V,
     const CplxVector &mu, const CplxVector &w,
     const Scalar phi, const CScalar &w0,
-    Vector &l ) {
+    Vector &l ) const {
 
   // Number of vertices
   int numV = m_V.rows();
@@ -548,7 +579,12 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergy(
   // Calculate 3D edge lengths
   igl::edge_lengths( X, m_E, l );
 
-  Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array()) ).sum();
+  // UNSCALED ENERGY
+  // Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array()) ).sum();
+  
+  // SCALED ENERGY
+  Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array())
+      / (L.array() * L.array()) ).sum() / tarA_E.sum();
 
   // ------------------------------------------------------------------------------------
   // Calculate Conformal Deviation Energy
@@ -590,13 +626,15 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergy(
 /// Calculate the DSEM energy functional and gradients for a given configuration
 ///
 template <typename Scalar, typename Index>
-Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
+Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad (
     const Vector &L, const Vector &tarA_E, const Vector &tarA_V,
     const CplxVector &mu, const CplxVector &w,
     const Scalar phi, const CScalar &w0,
     const Array &G1, const Array &G2, const Array &G3, const Array &G4,
     CplxVector &gradMu, CScalar &gradW0,
-    Scalar &gradPhi, Vector &l ) {
+    Scalar &gradPhi, Scalar &gradUNorm, Vector &l ) const {
+
+  std::cout << "Check EG 0" << std::endl;
 
   // Number of vertices
   int numV = m_V.rows();
@@ -612,15 +650,22 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
   CplxVector uC = std::exp( CScalar(Scalar(0.0), phi) ) *
     ( (w.array() - w0) / (Scalar(1.0) - std::conj(w0) * w.array()) );
 
+  std::cout << "Check EG 1" << std::endl;
+
   // The real and imaginary parts of the updated mapping
   Vector u = uC.real();
   Vector v = uC.imag();
+
+  std::cout << "U size = " << u.size() << std::endl;
+  std::cout << "V size = " << v.size() << std::endl;
 
   // Calculate 3D vertex positions
   Matrix X(numV, 3);
   Matrix DXu(numV, 3);
   Matrix DXv(numV, 3);
   m_NNI( u, v, X, DXu, DXv );
+
+  std::cout << "Check EG 2" << std::endl;
 
   // Calculate directe 3D edge vectors
   Eigen::Matrix<Scalar, Eigen::Dynamic, 3> eVec(numE, 3);
@@ -631,7 +676,14 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
   // Calculate 3D edge lengths
   l = (eVec.array() * eVec.array()).rowwise().sum().sqrt();
 
-  Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array()) ).sum();
+  // UNSCALED ENERGY
+  // Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array()) ).sum();
+  
+  // SCALED ENERGY
+  Scalar E = ( tarA_E.array() * (l.array() - L.array()) * (l.array() - L.array())
+      / (L.array() * L.array()) ).sum() / tarA_E.sum();
+
+  std::cout << "Check EG 3" << std::endl;
 
   // ------------------------------------------------------------------------------------
   // Calculate DSEM Energy Gradients
@@ -640,6 +692,11 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
   // Calculate energy gradient operator
   RowVector GOp(1, 2*numV);
   this->energyGradientOperator( DXu, DXv, eVec, l, L, tarA_E, GOp );
+
+  std::cout << "Check EG 4" << std::endl;
+
+  // Calculate the norm of the gradient with respect to the fully composed parameterization
+  gradUNorm = ( GOp * m_speye ).norm();
 
   // Construct the 'phi' gradient -------------------------------------------------------
   Vector dudphi( 2*numV, 1 );
@@ -668,6 +725,8 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
 
   Eigen::Matrix<Scalar, 1, 2> gradW0R = GOp * dUdw0;
   gradW0 = CScalar( gradW0R(0), gradW0R(1) );
+
+  std::cout << "Check EG 5" << std::endl;
 
   // Construct the 'mu' gradient --------------------------------------------------------
   CplxArrayVec dUdw1 = std::exp( CScalar(Scalar(0.0), phi) ) *
@@ -712,6 +771,8 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
 
   }
 
+  std::cout << "Check EG 6" << std::endl;
+
   // ------------------------------------------------------------------------------------
   // Calculate Conformal Deviation Energy and Gradient
   // ------------------------------------------------------------------------------------
@@ -755,6 +816,332 @@ Scalar DSEMpp::DSEM<Scalar, Index>::calculateEnergyAndGrad(
 
 };
 
+// ======================================================================================
+// BELTRAMI HOLOMORPHIC FLOW
+// ======================================================================================
+
+///
+/// Assemble the various quantity lists into a single global vector
+///
+template <typename Scalar, typename Index>
+DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::assembleGlobalQuantities (
+    const CplxVector &muQ, const CScalar &w0Q, const Scalar &phiQ, Vector &xQ ) const {
+
+  xQ << phiQ, w0Q.real(), w0Q.imag(), muQ.real(), muQ.imag();
+
+};
+
+///
+/// Disassemble a global vector into the various quantitty lists
+///
+template <typename Scalar, typename Index>
+DSEM_INLINE void DSEMpp::DSEM<Scalar, Index>::disassembleGlobalQuantities (
+    const Vector &xQ, CplxVector &muQ, CScalar &w0Q, Scalar &phiQ ) const {
+
+  phiQ = xQ(0);
+
+  w0Q = CScalar( xQ(1), xQ(2) );
+
+  int numV = muQ.size();
+  for( int i = 0; i < numV; i++ ) {
+
+    muQ(i) = CScalar( xQ(i+3), xQ(i+3+numV) );
+
+  }
+
+};
+
+///
+/// Calculate the SEM distance for a given discrete metric
+///
+template <typename Scalar, typename Index>
+Scalar DSEMpp::DSEM<Scalar, Index>::operator() (
+    const Vector &L,
+    const CplxVector &initMu, const CplxVector &initMap,
+    const Scalar &initPhi, const CScalar &initW0,
+    CplxVector &mu, CplxVector &w,
+    Scalar &phi, CScalar &w0, Vector &l ) const {
+
+  // Number of vertices
+  int numV = m_V.rows();
+
+  // Number of faces
+  int numF = m_F.rows();
+
+  // Number of edges
+  int numE = m_E.rows();
+
+  // ------------------------------------------------------------------------------------
+  // Input Processing
+  // ------------------------------------------------------------------------------------
+  
+  // Process target metric --------------------------------------------------------------
+  
+  // Check target edge list size
+  if (L.size() != numE) {
+    throw std::runtime_error("Improperly sized target edge list");
+  }
+
+  // Check target edge list entries
+  for( int i = 0; i < numE; i++ ) {
+    if ( (!std::isfinite(L(i))) || (L(i) <= 0) ) {
+      throw std::runtime_error("Invalid target edge list");
+    }
+  }
+
+  // Associate target edges to faces
+  Eigen::Array<Scalar, Eigen::Dynamic, 3> L_F( numF, 3 );
+  for( int i = 0; i < numF; i++ ) {
+    for( int j = 0; j < 3; j++ ) {
+      L_F(i,j) = L( m_FE(i,j) );
+    }
+  }
+
+  // Check that the input edge list satisfies the triangle inequality
+  ArrayVec S_F = L_F.rowwise().sum(); // 2x the semi-perimeter in Heron's formula
+
+  Eigen::Array<bool, Eigen::Dynamic, 3> badMetric(numF, 3);
+  badMetric = (S_F.replicate(1,3) - Scalar(2.0) * L_F.array()) <= Scalar(0.0);
+  if ( badMetric.any() ) {
+    throw std::runtime_error("Target metric does NOT satisfy the triangle inequality");
+  }
+
+  // Calculate target face areas
+  S_F = S_F / Scalar(2.0);
+  
+  Vector tarA_F = ( ( S_F * (S_F - L_F.col(0)) *
+        (S_F - L_F.col(1)) * (S_F - L_F.col(2)) ).sqrt() ).matrix();
+
+  // Calculate target edge areas
+  Vector tarA_E = Vector::Zero( numE, 1 );
+  for( int i = 0; i < numE; i++ ) {
+    for( int j = 0; j < m_EF[i].size(); j++ ) {
+
+      tarA_E(i) += tarA_F( m_EF[i][j] );
+
+    }
+  }
+
+  tarA_E = (tarA_E.array() / Scalar(3.0)).matrix();
+
+  // Calculate target vertex areas
+  Vector tarA_V = Vector::Zero( numV, 1 );
+  for( int i = 0; i < numF; i++ ) {
+    for( int j = 0; j < 3; j++ ) {
+
+      tarA_V( m_F(i,j) ) += tarA_F(i);
+
+    }
+  }
+
+  tarA_V = (tarA_V.array() / Scalar(3.0)).matrix();
+
+  // Initial guess processing -----------------------------------------------------------
+  // TODO
+  
+  // Set optimization parameters according to the initial guess
+  mu = initMu;
+  w = initMap;
+  phi = initPhi;
+  w0 = initW0;
+
+  // Clip the boundary vertices of w to the unit circle
+  DSEMpp::clipToUnitCircle( m_bdyIDx, w );
+  
+  // ------------------------------------------------------------------------------------
+  // Run the Beltrami Holomorphic Flow via L-BFGS
+  // ------------------------------------------------------------------------------------
+  
+  // Optimization Pre-Processing --------------------------------------------------------
+  
+  // The objective function value
+  Scalar fx;
+  
+  // The number of unknowns to determine
+  const int numUnknowns = 3 + 2 * numV;
+  
+  // Approximation to the Hessian matrix
+  DSEMpp::BFGSMat<Scalar> bfgs;
+  bfgs.reset(numUnknowns, m_param.m);
+
+  // Current global unknown list
+  Vector x(numUnknowns, 1);
+
+  // Old global unknown list
+  Vector xp(numUnknowns, 1);
+
+  // Old quasiconformal map
+  CplxVector wp(numV, 1);
+
+  // New global gradient
+  Vector grad(numUnknowns, 1);
+  
+  // Old global gradient
+  Vector gradp(numUnknowns, 1);
+
+  // The update direction
+  Vector drt(numUnknowns, 1);
+
+  // The update direction for the quasiconformal mapping
+  CplxVector dw(numV, 1);
+
+  // The length of the lag for objective function values to test convergence
+  const int fpast = m_param.past;
+  
+  // History of objective function values
+  Vector fxp;
+  if ( m_param.past > 0 ) { fxp.resize(fpast); }
+
+  // Storage for calculating the Beltrami coefficient from the mapping
+  CplxVector muF( numF, 1 );
+
+  // Handle the '0th' Iteration ---------------------------------------------------------
+  
+  // Calculate the mapping kernel
+  Array G1( numV, numV );
+  Array G2( numV, numV );
+  Array G3( numV, numV );
+  Array G4( numV, numV );
+  calculateMappingKernel( w, G1, G2, G3, G4 );
+
+  // Evaluate the function and gradient for initial configuration
+  CplxVector gradMu( numV, 1 );
+  CScalar gradW0( Scalar(0.0), Scalar(0.0) );
+  Scalar gradPhi = Scalar(0.0);
+  Scalar gradUNorm = Scalar(0.0);
+
+  fx = calculateEnergyAndGrad( L, tarA_E, tarA_V,
+      mu, w, phi, w0, G1, G2, G3, G4,
+      gradMu, gradW0, gradPhi, gradUNorm, l );
+
+  // Assemble the global unknown vector
+  assembleGlobalQuantities( mu, w0, phi, x );
+
+  // Assemble the global gradient vector
+  assembleGlobalQuantities( gradMu, gradW0, gradPhi, grad );
+
+  // Updated vector norms
+  Scalar xnorm = x.norm();
+  Scalar gnorm = grad.norm();
+
+  if (true) {
+
+    std::cout << "(0)"
+      << " ||du|| = " << std::fixed << std::setw(10) << std::setprecision(7) << gradUNorm
+      << " ||dx|| = " << std::setw(10) << std::setprecision(7) << gnorm
+      << " ||x|| = " << std::setprecision(4) << std::setw(6) << xnorm
+      << " f(x) = " << std::setw(15) << std::setprecision(10) << fx << std::endl;
+
+  }
+
+  if ( fpast > 0 ) { fxp[0] = fx; }
+
+  // Early exit if the initial guess is already a minimizer
+  if ( gnorm <= m_param.epsilon || gnorm <= m_param.epsilonRel * xnorm ) {
+    return fx;
+  }
+
+  // Initial update direction
+  drt.noalias() = -grad;
+
+  // Disassemble the update dirrection
+  CplxVector dmu(numV, 1);
+  CScalar dw0( Scalar(0.0), Scalar(0.0) );
+  Scalar dphi = Scalar(0.0);
+
+  disassembleGlobalQuantities( drt, dmu, dw0, dphi );
+
+  // Calculate the inital update direction for the quasiconformal mapping
+  calculateMappingUpdate(dmu, G1, G2, G3, G4, dw);
+
+  // Initial step size
+  Scalar step = Scalar(1.0) / drt.norm();
+
+  // Handle All Subsequent Iterations ---------------------------------------------------
+  
+  int iterNum = 1;
+  for( ; ; ) {
+
+    xp.noalias() = x; // Save the current global unknown vector
+    wp.noalias() = w; // Save the current quasiconformal mapping
+    gradp.noalias() = grad; // Save the current global gradient vector
+
+    // Perform line search to update unknowns
+    DSEMpp::LineSearchBacktracking<Scalar, Index>::LineSearch(
+        *this, m_param, L, tarA_E, tarA_V, xp, wp, drt, dw,
+        fx, x, w, grad, gradUNorm, step, l );
+
+    // Disassemble the global unknown vector
+    disassembleGlobalQuantities( x, mu, w0, phi );
+
+    // New vector norms
+    xnorm = x.norm(); 
+    gnorm = grad.norm();
+
+    if (true) {
+
+      std::cout << "(" << std::setw(2) << iterNum << ")"
+        << " ||du|| = " << std::fixed << std::setw(10)
+        << std::setprecision(7) << gradUNorm
+        << " ||dx|| = " << std::setprecision(7) << std::setw(10) << gnorm
+        << " ||x|| = " << std::setprecision(4) << std::setw(6) << xnorm
+        << " f(x) = " << std::setw(15) << std::setprecision(14)
+        << fx << std::endl;
+
+    }
+
+    // CONVERGENCE TEST -- Gradient
+    if ( gnorm <= m_param.epsilon || gnorm <= m_param.epsilonRel * xnorm ) {
+      return fx;
+    }
+
+    // CONVERGENCE TEST -- Objective function value
+    if ( fpast > 0 ) {
+
+      const Scalar fxd = fxp[iterNum % fpast];
+      Scalar smallChange = m_param.delta * std::max(std::max(abs(fx), abs(fxd)), Scalar(1.0));
+
+      bool longEnough = iterNum >= fpast;
+      bool slowChange = std::abs(fxd-fx) <= smallChange;
+
+      if( longEnough && slowChange ) {
+        return fx;
+      }
+
+      fxp[iterNum % fpast] = fx;
+
+    }
+
+    // CONVERGENCE TEST -- Maximum number of iterations
+    if ( m_param.maxIterations != 0 && iterNum >= m_param.maxIterations ) {
+      return fx;
+    }
+
+    // Update s and y
+    // s_{k+1} = x_{k+1} - x_k
+    // y_{k+1} = g_{k+1} - g_k
+    bfgs.addCorrection( x - xp, grad - gradp );
+
+    // Recursive formula to compute d = -H * g
+    bfgs.applyHv( grad, -Scalar(1.0), drt );
+
+    // Disassemble the update direction
+    disassembleGlobalQuantities(drt, dmu, dw0, dphi);
+
+    // Calculate the update direction for the quasiconformal mapping
+    calculateMappingUpdate( dmu, G1, G2, G3, G4, dw );
+
+    // Reset step = 1.0 as initial guess for the next line search
+    step = Scalar(1.0);
+
+    // Increment the iteration count
+    iterNum++;
+
+  }
+
+  return fx;
+
+};
 
 //TODO: Add explicit template instantiation
 #ifdef DSEM_STATIC_LIBRARY

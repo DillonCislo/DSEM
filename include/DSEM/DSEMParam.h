@@ -30,20 +30,25 @@ namespace DSEMpp {
   enum LINE_SEARCH_TERMINATION_CONDITION {
 
     ///
+    /// Accept any positive step size. NOT RECOMMENDED
+    ///
+    LINE_SEARCH_TERMINATION_NONE = 1,
+
+    ///
     /// Find a step length that satisfies the sufficient decrease
     /// or Armijo condition.
     ///
-    LINE_SEARCH_TERMINATION_ARMIJO = 1,
+    LINE_SEARCH_TERMINATION_ARMIJO = 2,
 
     ///
     /// Find a step length that satisfies the regular Wolfe conditions
     ///
-    LINE_SEARCH_TERMINATION_WOLFE = 2,
+    LINE_SEARCH_TERMINATION_WOLFE = 3,
 
     ///
     /// Find a step length that satisfies the strong Wolfe conditions
     ///
-    LINE_SEARCH_TERMINATION_STRONG_WOLFE = 3,
+    LINE_SEARCH_TERMINATION_STRONG_WOLFE = 4,
 
   };
 

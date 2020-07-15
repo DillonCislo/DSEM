@@ -21,6 +21,7 @@
 
 #include "dsemInline.h"
 
+#include <vector>
 #include <complex>
 #include <Eigen/Core>
 #include <Eigen/SparseCore>
@@ -80,6 +81,14 @@ namespace DSEMpp {
       // #E by 2 matrix. Discrete surface edge connectivity list
       Eigen::Matrix<Index, Eigen::Dynamic, 2> m_E;
 
+      // #E by 3 matrix. m_EF(i,j) is the ID of the edge opposite
+      // vertex j in face i
+      Eigen::Matrix<Index, Eigen::Dynamic, 3> m_FE;
+
+      // #E by 1 vector of vectors. Contains the IDs of faces attached
+      // to unoriented edges
+      std::vector<std::vector<Index> > m_EF;
+
       // #V by #F sparse matrix operator. Averages face-based quantities onto
       // vertices using angle weighting in the domain of parameterization
       Eigen::SparseMatrix<Scalar> m_F2V;
@@ -101,6 +110,10 @@ namespace DSEMpp {
 
       // A vector of all vertex IDs in the bulk
       IndexVector m_bulkIDx;
+
+      // #2V by #2V sparse identity matrix. Used to calculate abbreviated gradients
+      // with respect to fully composed parameterization
+      Eigen::SparseMatrix<Scalar> m_speye;
 
       // Mesh Differential Operators ----------------------------------------------------
 
@@ -150,13 +163,47 @@ namespace DSEMpp {
       ///
       /// Inputs:
       ///
-      ///   L     #E by 1 list of target edge lengths
+      ///   L         #E by 1 list of target edge lengths
+      ///
+      ///   initMu    #V by 1 initial guess for the Beltrami coefficient
+      ///             that specifies the mapping corresponding to the minimum
+      ///             distance SEM
+      ///
+      ///   initMap   #V by 1 complex representation of the quasiconformal
+      ///             mapping specified by 'initMu'
+      ///
+      ///   initPhi   Initial guess for the rotation angle of the Mobius
+      ///             transformation corresponding to the minimum distance SEM
+      ///
+      ///   initW0    Initial guess for the complex parameter of the Mobius
+      ///             transformation corresponding to the minimum distance SEM
       ///
       /// Outputs:
       ///
       ///   D     The SEM distance
       ///
-      Scalar operator()( const Vector &L );
+      ///   mu    #V by 1 complex representation of the Beltrami coefficient
+      ///         that specifies the mapping corresponding to the minimum distance SEM
+      ///
+      ///   w     #V by 1 complex representation of the quasiconformal mapping
+      ///         specified by mu. NOTE: Does NOT include the post-composition with
+      ///         a Mobius transformation
+      ///
+      ///   phi   Overall rotation part of the Mobius transformation corresponding
+      ///         to the minimum distance SEM
+      ///
+      ///   w0    Complex paramter of the Mobius transformation corresponding to the
+      ///         minimum distance SEM
+      ///
+      ///   l     #E by 1 list of edge lengths. This is the discrete SEM that
+      ///         minimuzed Dsem for the target metric
+      ///
+      Scalar operator() ( const Vector &L,
+          const CplxVector &initMu, const CplxVector &initMap,
+          const Scalar &initPhi, const CScalar &initW0,
+          CplxVector &mu, CplxVector &w,
+          Scalar &phi, CScalar &w0, Vector &l ) const;
+
 
     public:
 
@@ -190,11 +237,11 @@ namespace DSEMpp {
       ///
       ///   l       #E by 1 list of calculated edge lengths
       ///
-      Scalar calculateEnergy(
+      Scalar calculateEnergy (
           const Vector &L, const Vector &tarA_E, const Vector &tarA_V,
           const CplxVector &mu, const CplxVector &w,
           const Scalar phi, const CScalar &w0,
-          Vector &l );
+          Vector &l ) const;
 
       ///
       /// Calculate the DSEM energy functional and gradients for a given configuration
@@ -230,23 +277,26 @@ namespace DSEMpp {
       ///
       /// Outputs:
       ///
-      ///   E       The total energy for the input configuration
+      ///   E           The total energy for the input configuration
       ///
-      ///   gradMu  #V by 1 complex gradient vector wrt the Beltrami coefficient
+      ///   gradMu      #V by 1 complex gradient vector wrt the Beltrami coefficient
       ///
-      ///   gradW0  Scalar complex gradient wrt the Mobius parameter
+      ///   gradW0      Scalar complex gradient wrt the Mobius parameter
       ///
-      ///   gradPhi Scalar gradient wrt the overal rotation
+      ///   gradPhi     Scalar gradient wrt the overal rotation
       ///
-      ///   l       #E by 1 list of calculated edge lengths
+      ///   gradUNorm   Scalar norm of the gradient with respect to the fully
+      ///               composed parameterization
       ///
-      Scalar calculateEnergyAndGrad(
+      ///   l           #E by 1 list of calculated edge lengths
+      ///
+      Scalar calculateEnergyAndGrad (
           const Vector &L, const Vector &tarA_E, const Vector &tarA_V,
           const CplxVector &mu, const CplxVector &w,
           const Scalar phi, const CScalar &w0,
           const Array &G1, const Array &G2, const Array &G3, const Array &G4,
           CplxVector &gradMu, CScalar &gradW0,
-          Scalar &gradPhi, Vector &l );
+          Scalar &gradPhi, Scalar &gradUNorm, Vector &l ) const;
 
       ///
       /// Construct the operator that calculates global gradients
@@ -274,11 +324,11 @@ namespace DSEMpp {
       ///   GOp     1 by (2*#V) operator that compiles vertex based gradients
       ///           into complete energy gradients
       ///
-      DSEM_INLINE void energyGradientOperator(
+      DSEM_INLINE void energyGradientOperator (
           const Matrix &DXu, const Matrix &DXv,
           const Eigen::Matrix<Scalar, Eigen::Dynamic, 3> &eVec,
           const Vector &l, const Vector &L, const Vector &tarA_E,
-          RowVector &GOp );
+          RowVector &GOp ) const;
 
       ///
       /// Construct the components of the kernel that is integrated to find the
@@ -299,8 +349,8 @@ namespace DSEMpp {
       ///
       ///   G4      #V by #V array. Coefficient of nu2 in the imaginary part of K
       ///
-      DSEM_INLINE void calculateMappingKernel( const CplxVector &w,
-          Array &G1, Array &G2, Array &G3, Array &G4 );
+      DSEM_INLINE void calculateMappingKernel ( const CplxVector &w,
+          Array &G1, Array &G2, Array &G3, Array &G4 ) const;
 
       ///
       /// Calculates the change in the quasiconformal mapping for a given variation
@@ -324,9 +374,9 @@ namespace DSEMpp {
       ///
       ///   dW      #V by 1 change in the mapping
       ///
-      DSEM_INLINE void calculateMappingUpdate( const CplxVector &nu,
+      DSEM_INLINE void calculateMappingUpdate ( const CplxVector &nu,
           const Array &G1, const Array &G2,
-          const Array &G3, const Array &G4, CplxVector &dW );
+          const Array &G3, const Array &G4, CplxVector &dW ) const;
 
       ///
       /// Construct the intrinsic differential operators on the surface mesh
@@ -337,6 +387,49 @@ namespace DSEMpp {
       /// Construct the mesh function averaging operators
       ///
       void constructAveragingOperators();
+
+      ///
+      /// Assemble the various quantity lists into a single global vector
+      ///
+      /// Inputs:
+      ///
+      ///   muQ     #V by 1 complex representation of a quantitiy associated
+      ///           with the Beltrami coefficient
+      ///
+      ///   w0Q     A complex variable associated with the complex parameter
+      ///           of the Mobius mapping
+      ///
+      ///   phiQ    A scalar variable associated with the overall rotation
+      ///           of the Mobius mapping
+      ///
+      /// Outputs:
+      ///
+      ///   xQ      (3 + 2*#V) by 1 real aggregation of values
+      ///
+      DSEM_INLINE void assembleGlobalQuantities (
+          const CplxVector &muQ, const CScalar &w0Q, const Scalar &phiQ, Vector &xQ ) const;
+
+      ///
+      /// Disassemble a global vector into the various quantity lists
+      ///
+      /// Inputs:
+      ///
+      ///   xQ      (3 + 2*#V) by 1 real aggregation of values
+      ///
+      /// Outputs:
+      ///
+      ///   muQ     #V by 1 complex representation of a quantitiy associated
+      ///           with the Beltrami coefficient
+      ///
+      ///   w0Q     A complex variable associated with the complex parameter
+      ///           of the Mobius mapping
+      ///
+      ///   phiQ    A scalar variable associated with the overall rotation
+      ///           of the Mobius mapping
+      ///
+      ///
+      DSEM_INLINE void disassembleGlobalQuantities (
+          const Vector &xQ, CplxVector &muQ, CScalar &w0Q, Scalar &phiQ ) const;
 
   };
 

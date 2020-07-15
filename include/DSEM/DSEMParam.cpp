@@ -65,7 +65,7 @@ DSEM_INLINE void DSEMpp::DSEMParam<Scalar>::checkParam() const {
     throw std::invalid_argument("'delta' must be non-negative");
   if ( maxIterations < 0 )
     throw std::invalid_argument("'maxIterations' must be non-negative");
-  if ( lineSearchTermination < LINE_SEARCH_TERMINATION_ARMIJO ||
+  if ( lineSearchTermination < LINE_SEARCH_TERMINATION_NONE ||
      lineSearchTermination > LINE_SEARCH_TERMINATION_STRONG_WOLFE )
     throw std::invalid_argument("Unsupported line search termination condition");
   if ( lineSearchMethod < LINE_SEARCH_BACKTRACKING ||
